@@ -5,7 +5,7 @@
 ;; Author: Enrico Flor <enrico@eflor.net>
 ;; Maintainer: Enrico Flor <enrico@eflor.net>
 ;; URL: https://github.com/enricoflor/typewriter.el
-;; Version: 1.1.0
+;; Version: 1.2.0
 ;; Keywords: wp
 
 ;; Package-Requires: ((emacs "30.1"))
@@ -101,13 +101,70 @@ to visually separate the counter from preceding items in the mode line."
 If 0, `typewriter-tab' is disabled."
   :type 'natnum)
 
+(defcustom typewriter-jam-base-probability 0.0
+  "Base probability that key jams occur.
+
+With a value equal or less than 0.0, no jam ever occurs; with a value
+equal or greater than 1.0, no ink is ever added to the
+buffer (`typewriter-mode' becomes useless).
+
+If the value is greater than 0.0, the actual probability that a jam
+occurs is increased if keys are pressed in very rapid sequence, or if
+that very key has jammed once already."
+  :type 'float)
+
+(defcustom typewriter-fast-sequence-threshold 0.1
+  "Threshold below which a keystroke sequence is fast, in seconds.
+
+The default value of 0.1 corresponds to 100 milliseconds.  A value of
+0.0 or less guarantees no keystroke sequence will ever count as fast."
+  :type 'float)
+
+(defcustom typewriter-jam-fast-sequence-boost 1.0
+  "Factor by which fast keystroke sequences magnify the jam probability.
+
+Applied by multiplying `typewriter-jam-base-probability' by this factor
+when the gap since the previous keystroke is below
+`typewriter-fast-sequence-threshold'.  A value of 1.0 has no effect;
+values greater than 1.0 make jams more likely under fast typing.
+
+This has no effect at all with a value for
+`typewriter-jam-base-probability' equal or less than 0.0."
+  :type 'float)
+
+(defcustom typewriter-jam-repeat-boost 1.0
+  "Factor by which a previously-jammed key magnifies the jam probability.
+
+Applied by multiplying `typewriter-jam-base-probability' by this factor
+when the current keystroke has already jammed once in this buffer (see
+`typewriter--jammed-keystrokes').  A value of 1.0 has no effect; values
+greater than 1.0 make a key more prone to jamming again once it has
+jammed before.
+
+This has no effect at all with a value for
+`typewriter-jam-base-probability' equal or less than 0.0."
+  :type 'float)
+
+(defvaralias 'typewriter-newline-hook 'typewriter-carriage-return-hook)
+(defvaralias 'typewriter-insert-hook 'typewriter-keystroke-hook)
+
 (defcustom typewriter-keystroke-hook nil
-  "Hook run after successfully striking a key (inserting a character)."
+  "Hook run after successfully inserting a character."
   :type 'hook)
 
 (defcustom typewriter-carriage-return-hook nil
   "Hook run after inserting a new line."
   :type 'hook)
+
+(defcustom typewriter-backward-char-hook nil
+  "Hook run after moving backward."
+  :type 'hook)
+
+(defcustom typewriter-tab-hook nil
+  "Hook run after successfully inserting a tab."
+  :type 'hook)
+
+
 
 (defun typewriter--mode-line-remaining ()
   "Return a mode line string with columns left before the margin.
@@ -124,6 +181,63 @@ Returns the empty string outside `typewriter-mode', or when
                 (max 0 (- typewriter-fill-column curr))))
     ""))
 
+(defvar-local typewriter--jammed-keystrokes nil
+  "List of keystroke events that have jammed in this buffer.
+
+Consulted before jamming a key: if the same key has already jammed,
+probability of jamming again is increased by multiplying the probability
+by the value of `typewriter-jam-repeat-boost'.")
+
+(defconst typewriter--keystroke-functions '(typewriter-backward-char
+                                            typewriter-tab
+                                            typewriter-newline
+                                            typewriter-self-insert)
+  "Commands that `typewriter-mode' considers keystrokes.")
+
+(defvar-local typewriter--last-keystroke-time 0.0
+  "Time of the most recent keystroke in this buffer.
+
+A float, as returned by `float-time'.  The default of 0.0 ensures the
+very first keystroke is never treated as part of a fast sequence, since
+the gap against the Unix epoch is always large.
+
+A keystroke is a call to one of the commands in
+`typewriter--keystroke-functions'.")
+
+(defun typewriter--occurs-p (probability)
+  "Probabilistic gate on PROBABILITY.
+
+While any float value for PROBABILITY is tolerated, only (0.0, 1.0)
+values are meaningful."
+  (declare (side-effect-free t))
+  (cond ((< 0.0 probability 1.0)
+         (< (/ (random 1000000) 1000000.0) probability))
+        ((<= probability 0.0) nil)
+        (t t)))
+
+(defun typewriter--jam-probability (gap event)
+  "Combined jam probability, given GAP since the last keystroke and EVENT.
+
+`typewriter-jam-fast-sequence-boost' (if GAP is below
+`typewriter-fast-sequence-threshold') and `typewriter-jam-repeat-boost'
+(if EVENT is in `typewriter--jammed-keystrokes') each multiply
+`typewriter-jam-base-probability' by their factor.
+
+If `typewriter-jam-base-probability' is 0.0 or less, return 0.0.  The
+result may exceed 1.0; `typewriter--occurs-p' treats any such value as
+certainty."
+  (declare (side-effect-free t))
+  (let ((p (max typewriter-jam-base-probability 0.0)))
+    (when (and (< gap typewriter-fast-sequence-threshold)
+               (< 1.0 typewriter-jam-fast-sequence-boost))
+      (setq p (* p typewriter-jam-fast-sequence-boost)))
+    (when (and (memq event typewriter--jammed-keystrokes)
+               (< 1.0 typewriter-jam-repeat-boost))
+      (setq p (* p typewriter-jam-repeat-boost)))
+    p))
+
+
+
 (defun typewriter-backward-char ()
   "Move the carriage left without deleting, allowing overstrikes."
   (interactive)
@@ -131,7 +245,8 @@ Returns the empty string outside `typewriter-mode', or when
                              (goto-char (point-max))
                              (line-beginning-position))))
     (if (> (point) active-line-start)
-        (backward-char 1)
+        (progn (backward-char 1)
+               (run-hooks 'typewriter-backward-char-hook))
       ;; carriage can't go back further than the left margin!
       (ding)
       (message "Carriage is at the left margin!"))))
@@ -150,7 +265,8 @@ the user."
              (inhibit-read-only t))
         ;; move-to-column with t automatically pads spaces only if
         ;; needed
-        (move-to-column next-stop t))
+        (move-to-column next-stop t)
+        (run-hooks 'typewriter-tab-hook))
     (message "TAB is disabled (typewriter-tab-width is not positive)")))
 
 (defun typewriter-self-insert ()
@@ -199,57 +315,67 @@ when point is `typewriter-warning-bell-offset' columns short of
 
 (defun typewriter--pre-command ()
   "Enforce margins and ink permanence for the pending keystroke."
-  (when (memq this-command '(typewriter-self-insert
-                             typewriter-newline
-                             typewriter-tab
-                             typewriter-backward-char))
+  (when (memq this-command typewriter--keystroke-functions)
 
-    (when (eq this-command 'typewriter-newline)
-      (if (save-excursion
-            (end-of-line)
-            (skip-chars-forward " \t\n")
-            (eobp))
-          (goto-char (point-max))
-        (forward-line 1)
-        (setq this-command 'ignore)))
+    (let ((gap (- (float-time) typewriter--last-keystroke-time)))
+      (setq typewriter--last-keystroke-time (float-time))
 
-    (unless (eq this-command 'ignore)
-      (let ((col (current-column)))
-        (cond
-         ((and (eq this-command 'typewriter-self-insert)
-               (not (eobp))
-               (not (eolp))
-               (not (looking-at-p "\t\\|\s")))
-          ;; trying to type over existing ink
-          (typewriter--bell-ring)
-          (message
-           (substitute-command-keys
-            "You can only overstrike blank spaces.  \\[typewriter-mode] to toggle off and edit"))
-          (setq this-command 'ignore))
+      (when (eq this-command 'typewriter-newline)
+        (if (save-excursion
+              (end-of-line)
+              (skip-chars-forward " \t\n")
+              (eobp))
+            (goto-char (point-max))
+          (forward-line 1)
+          (setq this-command 'ignore)))
 
-         ((and typewriter-fill-column
-               (not (eq this-command 'typewriter-newline))
-               (>= col typewriter-fill-column))
-          ;; we're at the margin
-          (typewriter--bell-ring t)
-          (typewriter--bell-ring)
-          (message
-           (substitute-command-keys
-            "Margin reached!  Press \\[typewriter-newline] to return the carriage."))
-          (setq this-command 'ignore))
+      (unless (eq this-command 'ignore)
+        (let ((col (current-column)))
+          (cond
 
-         (t
-          ;; just type
-          (typewriter--bell-ring t)
-          ;; This lift of inhibit-read-only is unrelated to the one in
-          ;; typewriter-self-insert: that one wraps the insertion
-          ;; command itself, while this one only covers deleting the
-          ;; placeholder space/tab that the new character is about to
-          ;; overstrike.
-          (when (and (eq this-command 'typewriter-self-insert)
-                     (looking-at-p "\t\\|\s"))
-            (let ((inhibit-read-only t))
-              (delete-char 1)))))))))
+           ((and (> typewriter-jam-base-probability 0.0)
+                 (typewriter--occurs-p
+                  (typewriter--jam-probability gap last-command-event)))
+            (add-to-list 'typewriter--jammed-keystrokes last-command-event)
+            (setq this-command 'ignore)
+            (typewriter--bell-ring)
+            (message "Key jammed!  Try again")
+            (sleep-for 1))
+
+           ((and (eq this-command 'typewriter-self-insert)
+                 (not (eobp))
+                 (not (eolp))
+                 (not (looking-at-p "\t\\|\s")))
+            ;; trying to type over existing ink
+            (typewriter--bell-ring)
+            (message
+             (substitute-command-keys
+              "You can only overstrike blank spaces.  \\[typewriter-mode] to toggle off and edit"))
+            (setq this-command 'ignore))
+
+           ((and typewriter-fill-column
+                 (not (eq this-command 'typewriter-newline))
+                 (>= col typewriter-fill-column))
+            ;; we're at the margin
+            (typewriter--bell-ring t)
+            (typewriter--bell-ring)
+            (message
+             (substitute-command-keys
+              "Margin reached!  Press \\[typewriter-newline] to return the carriage."))
+            (setq this-command 'ignore))
+
+           (t
+            ;; just type
+            (typewriter--bell-ring t)
+            ;; This lift of inhibit-read-only is unrelated to the one
+            ;; in typewriter-self-insert: that one wraps the insertion
+            ;; command itself, while this one only covers deleting the
+            ;; placeholder space/tab that the new character is about
+            ;; to overstrike.
+            (when (and (eq this-command 'typewriter-self-insert)
+                       (looking-at-p "\t\\|\s"))
+              (let ((inhibit-read-only t))
+                (delete-char 1))))))))))
 
 (defun typewriter--post-command ()
   "Run configured hooks after a keystroke or carriage return.
@@ -265,12 +391,14 @@ non-nil."
     (force-mode-line-update)))
 
 (defun typewriter--error-handler (data context caller)
-  "Handle read-only errors with a custom unlogged message."
+  "Handle read-only errors with a custom message."
   (if (eq (car data) 'buffer-read-only)
       (message
        (substitute-command-keys
         "You're in typewriter mode.  \\[typewriter-mode] to toggle off and edit"))
     (command-error-default-function data context caller)))
+
+
 
 (defvar-keymap typewriter-mode-map
   :doc "Keymap for `typewriter-mode'."
@@ -284,6 +412,7 @@ non-nil."
                                              tab-width
                                              tab-stop-list
                                              electric-indent-mode
+                                             auto-fill-function
                                              command-error-function
                                              fill-column)
   "Buffer-local variables that `typewriter-mode' temporarily overrides.
@@ -323,8 +452,10 @@ No deletions or arbitrary edits."
                     tab-width (max 1 typewriter-tab-width)
                     tab-stop-list nil
                     electric-indent-mode nil
-                    command-error-function #'typewriter--error-handler
-                    fill-column typewriter-fill-column)
+                    auto-fill-function nil
+                    command-error-function #'typewriter--error-handler)
+        (when typewriter-fill-column
+          (setq-local fill-column typewriter-fill-column))
         (add-hook 'pre-command-hook #'typewriter--pre-command nil t)
         (add-hook 'post-command-hook #'typewriter--post-command nil t)
         (when (<= typewriter-tab-width 0)
